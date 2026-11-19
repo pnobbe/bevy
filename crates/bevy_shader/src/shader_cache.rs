@@ -102,10 +102,13 @@ pub struct ShaderCache<ShaderModule, RenderDevice> {
         &ValidateShader,
     ) -> Result<ShaderModule, ShaderCacheError>,
     module_path_to_asset_id: HashMap<wesl::syntax::ModulePath, AssetId<Shader>>,
-    shaders: HashMap<AssetId<Shader>, Shader>,
+    shaders: HashMap<AssetId<Shader>, Arc<Shader>>,
     import_path_shaders: HashMap<ShaderImport, AssetId<Shader>>,
     waiting_on_import: HashMap<ShaderImport, Vec<AssetId<Shader>>>,
     missing_import_logged: HashSet<AssetId<Shader>>,
+    /// How often [`Self::clear`] reached each shader. [`Self::get_shared`] compares it before and
+    /// after composing outside the lock, to tell whether the variant it made is already stale.
+    changes: HashMap<AssetId<Shader>, u64>,
 }
 
 /// A compile time shader value definition to be inlined into the shader source.
@@ -162,6 +165,7 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
             import_path_shaders: Default::default(),
             waiting_on_import: Default::default(),
             missing_import_logged: Default::default(),
+            changes: Default::default(),
         }
     }
 
@@ -181,10 +185,138 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
         id: AssetId<Shader>,
         shader_defs: &[ShaderDefVal],
     ) -> Result<Arc<ShaderModule>, ShaderCacheError> {
+        let shader = match self.prepare(pipeline, id, shader_defs)? {
+            Prepared::Cached(module) => return Ok(module),
+            Prepared::Compose(shader) => shader,
+        };
+        debug!(
+            "processing shader {}, with shader defs {:?}",
+            id, shader_defs
+        );
+        let (source, deps) = compose(
+            &self.shaders,
+            &self.import_path_shaders,
+            &self.module_path_to_asset_id,
+            id,
+            &shader,
+            shader_defs,
+        )
+        .map_err(|e| self.compose_error(id, &shader, e))?;
+        let module = (self.load_module)(
+            &self.device,
+            source.into_source(&shader),
+            &shader.validate_shader,
+        )?;
+        Ok(self.store(id, shader_defs, Arc::new(module), deps))
+    }
+
+    /// Like [`Self::get`], but holds the cache's lock only to look up and to store the module.
+    ///
+    /// The shader is composed outside the lock, so pipeline tasks can compose in parallel. The module
+    /// is created and stored under `create`, a lock of its own: creating it pushes and pops a wgpu
+    /// validation error scope, which is global to the device unless wgpu's `std` feature is on.
+    /// Two tasks may compose the same variant at once; its module is created only once.
+    ///
+    /// A composition that [`Self::set_shader`] or [`Self::remove`] made stale meanwhile is never
+    /// cached: it is handed back, as `get` would have, while the change queues its pipelines again.
+    pub fn get_shared(
+        cache: &std::sync::Mutex<Self>,
+        create: &std::sync::Mutex<()>,
+        pipeline: CachedPipelineId,
+        id: AssetId<Shader>,
+        shader_defs: &[ShaderDefVal],
+    ) -> Result<Arc<ShaderModule>, ShaderCacheError>
+    where
+        RenderDevice: Clone,
+    {
+        let lock = || {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        loop {
+            let (changes, shader, shaders, imports, modules, device, load_module) = {
+                let mut c = lock();
+                let shader = match c.prepare(pipeline, id, shader_defs)? {
+                    Prepared::Cached(module) => return Ok(module),
+                    Prepared::Compose(shader) => shader,
+                };
+                (
+                    c.changes.clone(),
+                    shader,
+                    c.shaders.clone(),
+                    c.import_path_shaders.clone(),
+                    c.module_path_to_asset_id.clone(),
+                    c.device.clone(),
+                    c.load_module,
+                )
+            };
+            debug!(
+                "processing shader {}, with shader defs {:?}",
+                id, shader_defs
+            );
+            let composed = compose(&shaders, &imports, &modules, id, &shader, shader_defs);
+            // Modules are created and stored under `create`, so a variant another task made while
+            // this one was composing is found here, and its module is not created twice.
+            let _creating = create
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (source, deps) = {
+                let mut c = lock();
+                let stale = c.changes.get(&id) != changes.get(&id);
+                let (source, deps) = composed.map_err(|e| match e {
+                    // Not logged: the shader changed meanwhile, and its new source is logged when
+                    // its pipelines, queued again, compose it.
+                    ComposeError::ImportNotFound(_) if stale => {
+                        ShaderCacheError::ShaderImportNotYetAvailable
+                    }
+                    e => c.compose_error(id, &shader, e),
+                })?;
+                if let Some(module) = c
+                    .data
+                    .get(&id)
+                    .and_then(|data| data.processed_shaders.get(shader_defs))
+                {
+                    return Ok(module.clone());
+                }
+                (source, deps)
+            };
+            let module = load_module(
+                &device,
+                source.into_source(&shader),
+                &shader.validate_shader,
+            )?;
+            let mut c = lock();
+            let changed = |c: &Self, id: &AssetId<Shader>| c.changes.get(id) != changes.get(id);
+            if changed(&c, &id) {
+                // `clear` reached this shader meanwhile and queued its pipelines again. `get` would
+                // have stored this variant, then had it cleared: keep its dependents, not the module.
+                c.add_dependents(id, &deps);
+                return Ok(Arc::new(module));
+            }
+            if deps.iter().any(|dep| changed(&c, dep)) {
+                // A dependency changed before `clear` could reach this shader through it (dependents
+                // are recorded when a variant is stored). Record them, so that every further change
+                // reaches this shader as above, and compose again from the new sources.
+                c.add_dependents(id, &deps);
+                continue;
+            }
+            return Ok(c.store(id, shader_defs, Arc::new(module), deps));
+        }
+    }
+
+    /// Under the lock: the shader's imports resolved, the pipeline tracked, and the module if it is made.
+    fn prepare(
+        &mut self,
+        pipeline: CachedPipelineId,
+        id: AssetId<Shader>,
+        shader_defs: &[ShaderDefVal],
+    ) -> Result<Prepared<ShaderModule>, ShaderCacheError> {
         let shader = self
             .shaders
             .get(&id)
-            .ok_or(ShaderCacheError::ShaderNotLoaded(id))?;
+            .ok_or(ShaderCacheError::ShaderNotLoaded(id))?
+            .clone();
 
         let data = self.data.entry(id).or_default();
 
@@ -206,151 +338,55 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
         }
 
         data.pipelines.insert(pipeline);
+        Ok(match data.processed_shaders.get(shader_defs) {
+            Some(module) => Prepared::Cached(module.clone()),
+            None => Prepared::Compose(shader),
+        })
+    }
 
-        let mut wesl_dependencies: Vec<AssetId<Shader>> = Vec::new();
-
-        let module = match data.processed_shaders.entry_ref(shader_defs) {
-            EntryRef::Occupied(entry) => entry.into_mut(),
-            EntryRef::Vacant(entry) => {
-                debug!(
-                    "processing shader {}, with shader defs {:?}",
-                    id, shader_defs
-                );
-                let shader_source = match &shader.source {
-                    Source::SpirV(data) => ShaderCacheSource::SpirV(data.as_ref()),
-                    Source::Wesl(_) => {
-                        if let Some(module_path) = wesl_module_path(&shader.import_path) {
-                            let mut compiler_options = wesl::CompileOptions {
-                                imports: true,
-                                condcomp: true,
-                                visibility: false,
-                                ..Default::default()
-                            };
-
-                            let mut closure_defs = Vec::new();
-                            let mut visited = HashSet::new();
-                            let mut to_visit = vec![id];
-                            while let Some(dep_id) = to_visit.pop() {
-                                if !visited.insert(dep_id) {
-                                    continue;
-                                }
-                                let Some(dep) = self.shaders.get(&dep_id) else {
-                                    continue;
-                                };
-                                if dep_id != id {
-                                    closure_defs.extend(dep.shader_defs.iter());
-                                }
-                                for import in &dep.imports {
-                                    if let Some(import_id) = self.import_path_shaders.get(import) {
-                                        to_visit.push(*import_id);
-                                    }
-                                }
-                            }
-                            let mut constants = alloc::collections::BTreeMap::new();
-                            for shader_def in closure_defs
-                                .into_iter()
-                                .chain(shader_defs.iter())
-                                .chain(shader.shader_defs.iter())
-                            {
-                                match shader_def {
-                                    ShaderDefVal::Bool(key, value) => {
-                                        compiler_options
-                                            .features
-                                            .flags
-                                            .insert(key.to_string(), (*value).into());
-                                    }
-                                    ShaderDefVal::Int(key, value) => {
-                                        compiler_options
-                                            .features
-                                            .flags
-                                            .insert(key.to_string(), true.into());
-                                        constants.insert(key.as_ref(), value.to_string());
-                                    }
-                                    ShaderDefVal::UInt(key, value) => {
-                                        compiler_options
-                                            .features
-                                            .flags
-                                            .insert(key.to_string(), true.into());
-                                        constants.insert(key.as_ref(), value.to_string());
-                                    }
-                                }
-                            }
-                            let constants_source: String = constants
-                                .iter()
-                                .map(|(name, value)| format!("const {name} = {value};\n"))
-                                .collect();
-
-                            let shader_resolver = ShaderResolver::new(
-                                &self.module_path_to_asset_id,
-                                &self.shaders,
-                                &constants_source,
-                            );
-
-                            let compiled =
-                                wesl::compile(&module_path, &compiler_options, &shader_resolver)
-                                    .map_err(|error| {
-                                        // We use render_plain to avoid rendering ANSI codes
-                                        // Workaround for: https://github.com/tokio-rs/tracing/issues/3378
-                                        if is_module_not_found(&error) {
-                                            if self.missing_import_logged.insert(id) {
-                                                warn!(
-                                                    "Shader `{}` has an unresolved import:\n{}",
-                                                    shader.path,
-                                                    error.diagnostic().render_plain()
-                                                );
-                                            }
-                                            ShaderCacheError::ShaderImportNotYetAvailable
-                                        } else {
-                                            ShaderCacheError::ProcessShaderError(
-                                                error.diagnostic().render_plain(),
-                                            )
-                                        }
-                                    })?;
-
-                            for used in &compiled.modules {
-                                let used_path = match &used.path.origin {
-                                    wesl::syntax::PathOrigin::Package(pkg) if pkg.contains('/') => {
-                                        Cow::Owned(wesl::syntax::ModulePath {
-                                            origin: wesl::syntax::PathOrigin::Package(
-                                                pkg.rsplit('/').next().unwrap().to_string(),
-                                            ),
-                                            components: used.path.components.clone(),
-                                        })
-                                    }
-                                    _ => Cow::Borrowed(&used.path),
-                                };
-                                if let Some(dep_id) =
-                                    self.module_path_to_asset_id.get(used_path.as_ref())
-                                    && *dep_id != id
-                                {
-                                    wesl_dependencies.push(*dep_id);
-                                }
-                            }
-
-                            ShaderCacheSource::Wgsl(compiled.to_string())
-                        } else {
-                            return Err(ShaderCacheError::ProcessShaderError(format!(
-                                "Wesl shader `{}` has a malformed import path `{:?}`",
-                                shader.path, shader.import_path
-                            )));
-                        }
-                    }
-                    Source::Wgsl(wgsl_source) => ShaderCacheSource::Wgsl(wgsl_source.to_string()),
-                };
-
-                let shader_module =
-                    (self.load_module)(&self.device, shader_source, &shader.validate_shader)?;
-
-                entry.insert_with_key(shader_defs.into(), Arc::new(shader_module))
+    /// Under the lock: a composition's error logged (an unresolved import once per shader).
+    fn compose_error(
+        &mut self,
+        id: AssetId<Shader>,
+        shader: &Shader,
+        error: ComposeError,
+    ) -> ShaderCacheError {
+        match error {
+            ComposeError::ImportNotFound(diagnostic) => {
+                if self.missing_import_logged.insert(id) {
+                    warn!(
+                        "Shader `{}` has an unresolved import:\n{}",
+                        shader.path, diagnostic
+                    );
+                }
+                ShaderCacheError::ShaderImportNotYetAvailable
             }
-        };
-        let module = module.clone();
-
-        for dep_id in wesl_dependencies {
-            self.data.entry(dep_id).or_default().dependents.insert(id);
+            ComposeError::Other(e) => e,
         }
+    }
 
-        Ok(module)
+    /// Under the lock: the module kept for its variant (unless another task stored it first) and the
+    /// shader's WESL dependencies recorded.
+    fn store(
+        &mut self,
+        id: AssetId<Shader>,
+        shader_defs: &[ShaderDefVal],
+        module: Arc<ShaderModule>,
+        wesl_dependencies: Vec<AssetId<Shader>>,
+    ) -> Arc<ShaderModule> {
+        let data = self.data.entry(id).or_default();
+        let module = match data.processed_shaders.entry_ref(shader_defs) {
+            EntryRef::Occupied(entry) => entry.get().clone(),
+            EntryRef::Vacant(entry) => entry.insert_with_key(shader_defs.into(), module).clone(),
+        };
+        self.add_dependents(id, &wesl_dependencies);
+        module
+    }
+
+    fn add_dependents(&mut self, id: AssetId<Shader>, wesl_dependencies: &[AssetId<Shader>]) {
+        for dep_id in wesl_dependencies {
+            self.data.entry(*dep_id).or_default().dependents.insert(id);
+        }
     }
 
     fn clear(&mut self, id: AssetId<Shader>) -> Vec<CachedPipelineId> {
@@ -361,6 +397,8 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
             if !visited.insert(handle) {
                 continue;
             }
+            let changes = self.changes.entry(handle).or_default();
+            *changes = changes.wrapping_add(1);
             if let Some(data) = self.data.get_mut(&handle) {
                 data.processed_shaders.clear();
                 pipelines_to_queue.extend(data.pipelines.iter().copied());
@@ -426,7 +464,7 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
                 ),
             }
         }
-        self.shaders.insert(id, shader);
+        self.shaders.insert(id, Arc::new(shader));
         pipelines_to_queue
     }
 
@@ -452,10 +490,162 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
     }
 }
 
+/// A shader's source made ready for `load_module`: the composed WGSL, or the shader's own SPIR-V.
+enum Composed {
+    Wgsl(String),
+    SpirV,
+}
+
+impl Composed {
+    fn into_source(self, shader: &Shader) -> ShaderCacheSource<'_> {
+        match (self, &shader.source) {
+            (Composed::Wgsl(s), _) => ShaderCacheSource::Wgsl(s),
+            (Composed::SpirV, Source::SpirV(data)) => ShaderCacheSource::SpirV(data.as_ref()),
+            (Composed::SpirV, _) => unreachable!("composed as SPIR-V from a text source"),
+        }
+    }
+}
+
+enum ComposeError {
+    ImportNotFound(String),
+    Other(ShaderCacheError),
+}
+
+enum Prepared<ShaderModule> {
+    Cached(Arc<ShaderModule>),
+    Compose(Arc<Shader>),
+}
+
+/// Composes one variant of a shader. Called by [`ShaderCache::get`] under the cache's lock, and by
+/// [`ShaderCache::get_shared`] outside it, on a snapshot of the cache's shaders.
+fn compose(
+    shaders: &HashMap<AssetId<Shader>, Arc<Shader>>,
+    import_path_shaders: &HashMap<ShaderImport, AssetId<Shader>>,
+    module_path_to_asset_id: &HashMap<wesl::syntax::ModulePath, AssetId<Shader>>,
+    id: AssetId<Shader>,
+    shader: &Shader,
+    shader_defs: &[ShaderDefVal],
+) -> Result<(Composed, Vec<AssetId<Shader>>), ComposeError> {
+    let mut wesl_dependencies: Vec<AssetId<Shader>> = Vec::new();
+    match &shader.source {
+        Source::SpirV(_) => Ok((Composed::SpirV, wesl_dependencies)),
+        Source::Wgsl(wgsl_source) => {
+            Ok((Composed::Wgsl(wgsl_source.to_string()), wesl_dependencies))
+        }
+        Source::Wesl(_) => {
+            if let Some(module_path) = wesl_module_path(&shader.import_path) {
+                let mut compiler_options = wesl::CompileOptions {
+                    imports: true,
+                    condcomp: true,
+                    visibility: false,
+                    ..Default::default()
+                };
+
+                let mut closure_defs = Vec::new();
+                let mut visited = HashSet::new();
+                let mut to_visit = vec![id];
+                while let Some(dep_id) = to_visit.pop() {
+                    if !visited.insert(dep_id) {
+                        continue;
+                    }
+                    let Some(dep) = shaders.get(&dep_id) else {
+                        continue;
+                    };
+                    if dep_id != id {
+                        closure_defs.extend(dep.shader_defs.iter());
+                    }
+                    for import in &dep.imports {
+                        if let Some(import_id) = import_path_shaders.get(import) {
+                            to_visit.push(*import_id);
+                        }
+                    }
+                }
+                let mut constants = alloc::collections::BTreeMap::new();
+                for shader_def in closure_defs
+                    .into_iter()
+                    .chain(shader_defs.iter())
+                    .chain(shader.shader_defs.iter())
+                {
+                    match shader_def {
+                        ShaderDefVal::Bool(key, value) => {
+                            compiler_options
+                                .features
+                                .flags
+                                .insert(key.to_string(), (*value).into());
+                        }
+                        ShaderDefVal::Int(key, value) => {
+                            compiler_options
+                                .features
+                                .flags
+                                .insert(key.to_string(), true.into());
+                            constants.insert(key.as_ref(), value.to_string());
+                        }
+                        ShaderDefVal::UInt(key, value) => {
+                            compiler_options
+                                .features
+                                .flags
+                                .insert(key.to_string(), true.into());
+                            constants.insert(key.as_ref(), value.to_string());
+                        }
+                    }
+                }
+                let constants_source: String = constants
+                    .iter()
+                    .map(|(name, value)| format!("const {name} = {value};\n"))
+                    .collect();
+
+                let shader_resolver =
+                    ShaderResolver::new(module_path_to_asset_id, shaders, &constants_source);
+
+                let compiled = wesl::compile(&module_path, &compiler_options, &shader_resolver)
+                    .map_err(|error| {
+                        // We use render_plain to avoid rendering ANSI codes
+                        // Workaround for: https://github.com/tokio-rs/tracing/issues/3378
+                        if is_module_not_found(&error) {
+                            ComposeError::ImportNotFound(error.diagnostic().render_plain())
+                        } else {
+                            ComposeError::Other(ShaderCacheError::ProcessShaderError(
+                                error.diagnostic().render_plain(),
+                            ))
+                        }
+                    })?;
+
+                for used in &compiled.modules {
+                    let used_path = match &used.path.origin {
+                        wesl::syntax::PathOrigin::Package(pkg) if pkg.contains('/') => {
+                            Cow::Owned(wesl::syntax::ModulePath {
+                                origin: wesl::syntax::PathOrigin::Package(
+                                    pkg.rsplit('/').next().unwrap().to_string(),
+                                ),
+                                components: used.path.components.clone(),
+                            })
+                        }
+                        _ => Cow::Borrowed(&used.path),
+                    };
+                    if let Some(dep_id) = module_path_to_asset_id.get(used_path.as_ref())
+                        && *dep_id != id
+                    {
+                        wesl_dependencies.push(*dep_id);
+                    }
+                }
+
+                Ok((Composed::Wgsl(compiled.to_string()), wesl_dependencies))
+            } else {
+                Err(ComposeError::Other(ShaderCacheError::ProcessShaderError(
+                    format!(
+                        "Wesl shader `{}` has a malformed import path `{:?}`",
+                        shader.path, shader.import_path
+                    ),
+                )))
+            }
+        }
+    }
+}
+
 /// A Wesl import resolver. Maps module paths to actual Wesl shader source.
 pub struct ShaderResolver<'a> {
     module_path_to_asset_id: &'a HashMap<wesl::syntax::ModulePath, AssetId<Shader>>,
-    shaders: &'a HashMap<AssetId<Shader>, Shader>,
+    shaders: &'a HashMap<AssetId<Shader>, Arc<Shader>>,
     constants_source: &'a str,
 }
 
@@ -465,7 +655,7 @@ impl<'a> ShaderResolver<'a> {
     /// `constants` module. This resolver is not meant to be long living.
     pub fn new(
         module_path_to_asset_id: &'a HashMap<wesl::syntax::ModulePath, AssetId<Shader>>,
-        shaders: &'a HashMap<AssetId<Shader>, Shader>,
+        shaders: &'a HashMap<AssetId<Shader>, Arc<Shader>>,
         constants_source: &'a str,
     ) -> Self {
         Self {
@@ -643,6 +833,99 @@ fn fragment() -> @location(0) vec4<f32> {
         cache.set_shader(lighting_id, lighting);
         cache.set_shader(maths_id, maths);
         cache.get(0, root_id, &[]).unwrap();
+    }
+
+    #[test]
+    fn get_shared_recomposes_after_a_concurrent_change() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex, OnceLock,
+        };
+
+        // `load_module` runs outside the cache's lock, so it stands in for another thread that
+        // hot-reloads an import while this variant is being composed.
+        static CACHE: OnceLock<Mutex<ShaderCache<String, ()>>> = OnceLock::new();
+        static RELOAD: AtomicBool = AtomicBool::new(true);
+        let cache = CACHE.get_or_init(|| {
+            Mutex::new(ShaderCache::new((), |_, source, _| {
+                let ShaderCacheSource::Wgsl(wgsl) = source else {
+                    panic!("expected wgsl output");
+                };
+                if RELOAD.swap(false, Ordering::SeqCst) {
+                    let (_, lighting_id, _) = test_ids();
+                    let lighting = Shader::from_wesl(
+                        "fn brighten(x: f32) -> f32 { return x + 0.5; }",
+                        "embedded://bevy_pbr/render/lighting.wesl",
+                    );
+                    CACHE
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .set_shader(lighting_id, lighting);
+                }
+                Ok(wgsl)
+            }))
+        });
+        let (_, _, root_id) = set_test_shaders(&mut cache.lock().unwrap());
+        let create = Mutex::new(());
+        let defs = [ShaderDefVal::Bool("BRIGHT".into(), true)];
+
+        // As with `get`, the first call may hand back the variant made from the old import, but
+        // it must not be cached: the reload queued the pipeline again, and that call sees it.
+        let _ = ShaderCache::get_shared(cache, &create, 0, root_id, &defs).unwrap();
+        assert!(!RELOAD.load(Ordering::SeqCst));
+        let compiled = ShaderCache::get_shared(cache, &create, 0, root_id, &defs).unwrap();
+        assert!(compiled.contains("+ 0.5"));
+        assert!(!compiled.contains("+ 0.1"));
+
+        let cached = ShaderCache::get_shared(cache, &create, 0, root_id, &defs).unwrap();
+        assert!(Arc::ptr_eq(&compiled, &cached));
+    }
+
+    #[test]
+    fn get_shared_recomposes_after_a_dependency_changes() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex, OnceLock,
+        };
+
+        // `maths` is used through a qualified path, not an import, so `clear` cannot reach the root
+        // through it until a variant is stored: `get_shared` must see the change and compose again.
+        static CACHE: OnceLock<Mutex<ShaderCache<String, ()>>> = OnceLock::new();
+        static RELOAD: AtomicBool = AtomicBool::new(true);
+        let cache = CACHE.get_or_init(|| {
+            Mutex::new(ShaderCache::new((), |_, source, _| {
+                let ShaderCacheSource::Wgsl(wgsl) = source else {
+                    panic!("expected wgsl output");
+                };
+                if RELOAD.swap(false, Ordering::SeqCst) {
+                    let (maths_id, _, _) = test_ids();
+                    let maths = Shader::from_wesl(
+                        "fn double(x: f32) -> f32 { return x * 3.0; }",
+                        "embedded://bevy_render/maths.wesl",
+                    );
+                    CACHE
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .set_shader(maths_id, maths);
+                }
+                Ok(wgsl)
+            }))
+        });
+        let (_, _, root_id) = set_test_shaders(&mut cache.lock().unwrap());
+        let create = Mutex::new(());
+        let defs = [ShaderDefVal::Bool("BRIGHT".into(), true)];
+
+        let compiled = ShaderCache::get_shared(cache, &create, 0, root_id, &defs).unwrap();
+        assert!(!RELOAD.load(Ordering::SeqCst));
+        assert!(compiled.contains("* 3.0"));
+        assert!(!compiled.contains("* 2.0"));
+
+        let cached = ShaderCache::get_shared(cache, &create, 0, root_id, &defs).unwrap();
+        assert!(Arc::ptr_eq(&compiled, &cached));
     }
 
     fn test_shaders() -> (Shader, Shader, Shader) {

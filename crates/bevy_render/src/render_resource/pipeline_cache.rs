@@ -220,6 +220,8 @@ pub struct PipelineCache {
     layout_cache: Arc<Mutex<LayoutCache>>,
     bindgroup_layout_cache: Arc<Mutex<BindGroupLayoutCache>>,
     shader_cache: Arc<Mutex<ShaderCache<WgpuShaderModule, RenderDevice>>>,
+    /// Held while a shader module is created, as that pushes and pops a wgpu validation error scope.
+    shader_create: Arc<Mutex<()>>,
     device: RenderDevice,
     pipelines: Vec<CachedPipeline>,
     waiting_pipelines: HashSet<CachedPipelineId>,
@@ -275,6 +277,7 @@ impl PipelineCache {
 
         Self {
             shader_cache: Arc::new(Mutex::new(ShaderCache::new(device.clone(), load_module))),
+            shader_create: default(),
             device,
             layout_cache: default(),
             bindgroup_layout_cache: default(),
@@ -540,6 +543,7 @@ impl PipelineCache {
     ) -> CachedPipelineState {
         let device = self.device.clone();
         let shader_cache = self.shader_cache.clone();
+        let shader_create = self.shader_create.clone();
         let layout_cache = self.layout_cache.clone();
         let mut bindgroup_layout_cache = self.bindgroup_layout_cache.lock().unwrap();
         let bind_group_layout = descriptor
@@ -552,10 +556,9 @@ impl PipelineCache {
 
         create_pipeline_task(
             async move {
-                let mut shader_cache = shader_cache.lock().unwrap();
-                let mut layout_cache = layout_cache.lock().unwrap();
-
-                let vertex_module = match shader_cache.get(
+                let vertex_module = match ShaderCache::get_shared(
+                    &shader_cache,
+                    &shader_create,
                     id,
                     descriptor.vertex.shader.id(),
                     &descriptor.vertex.shader_defs,
@@ -566,7 +569,13 @@ impl PipelineCache {
 
                 let fragment_module = match &descriptor.fragment {
                     Some(fragment) => {
-                        match shader_cache.get(id, fragment.shader.id(), &fragment.shader_defs) {
+                        match ShaderCache::get_shared(
+                            &shader_cache,
+                            &shader_create,
+                            id,
+                            fragment.shader.id(),
+                            &fragment.shader_defs,
+                        ) {
                             Ok(module) => Some(module),
                             Err(err) => return Err(err),
                         }
@@ -577,10 +586,12 @@ impl PipelineCache {
                 let layout = if descriptor.layout.is_empty() && descriptor.immediate_size == 0 {
                     None
                 } else {
-                    Some(layout_cache.get(&device, &bind_group_layout, descriptor.immediate_size))
+                    Some(layout_cache.lock().unwrap().get(
+                        &device,
+                        &bind_group_layout,
+                        descriptor.immediate_size,
+                    ))
                 };
-
-                drop((shader_cache, layout_cache));
 
                 let vertex_buffer_layouts = descriptor
                     .vertex
@@ -662,6 +673,7 @@ impl PipelineCache {
     ) -> CachedPipelineState {
         let device = self.device.clone();
         let shader_cache = self.shader_cache.clone();
+        let shader_create = self.shader_create.clone();
         let layout_cache = self.layout_cache.clone();
         let mut bindgroup_layout_cache = self.bindgroup_layout_cache.lock().unwrap();
         let bind_group_layout = descriptor
@@ -674,22 +686,26 @@ impl PipelineCache {
 
         create_pipeline_task(
             async move {
-                let mut shader_cache = shader_cache.lock().unwrap();
-                let mut layout_cache = layout_cache.lock().unwrap();
-
-                let compute_module =
-                    match shader_cache.get(id, descriptor.shader.id(), &descriptor.shader_defs) {
-                        Ok(module) => module,
-                        Err(err) => return Err(err),
-                    };
+                let compute_module = match ShaderCache::get_shared(
+                    &shader_cache,
+                    &shader_create,
+                    id,
+                    descriptor.shader.id(),
+                    &descriptor.shader_defs,
+                ) {
+                    Ok(module) => module,
+                    Err(err) => return Err(err),
+                };
 
                 let layout = if descriptor.layout.is_empty() && descriptor.immediate_size == 0 {
                     None
                 } else {
-                    Some(layout_cache.get(&device, &bind_group_layout, descriptor.immediate_size))
+                    Some(layout_cache.lock().unwrap().get(
+                        &device,
+                        &bind_group_layout,
+                        descriptor.immediate_size,
+                    ))
                 };
-
-                drop((shader_cache, layout_cache));
 
                 let constants: Vec<(&str, f64)> = descriptor
                     .constants
@@ -724,6 +740,7 @@ impl PipelineCache {
     ) -> CachedPipelineState {
         let device = self.device.clone();
         let shader_cache = self.shader_cache.clone();
+        let shader_create = self.shader_create.clone();
         let layout_cache = self.layout_cache.clone();
         let mut bindgroup_layout_cache = self.bindgroup_layout_cache.lock().unwrap();
         let bind_group_layout = descriptor
@@ -736,10 +753,9 @@ impl PipelineCache {
 
         create_pipeline_task(
             async move {
-                let mut shader_cache = shader_cache.lock().unwrap();
-                let mut layout_cache = layout_cache.lock().unwrap();
-
-                let mesh_module = match shader_cache.get(
+                let mesh_module = match ShaderCache::get_shared(
+                    &shader_cache,
+                    &shader_create,
                     id,
                     descriptor.mesh.shader.id(),
                     &descriptor.mesh.shader_defs,
@@ -750,7 +766,13 @@ impl PipelineCache {
 
                 let fragment_module = match &descriptor.fragment {
                     Some(fragment) => {
-                        match shader_cache.get(id, fragment.shader.id(), &fragment.shader_defs) {
+                        match ShaderCache::get_shared(
+                            &shader_cache,
+                            &shader_create,
+                            id,
+                            fragment.shader.id(),
+                            &fragment.shader_defs,
+                        ) {
                             Ok(module) => Some(module),
                             Err(err) => return Err(err),
                         }
@@ -759,7 +781,13 @@ impl PipelineCache {
                 };
 
                 let task_module = match &descriptor.task {
-                    Some(task) => match shader_cache.get(id, task.shader.id(), &task.shader_defs) {
+                    Some(task) => match ShaderCache::get_shared(
+                        &shader_cache,
+                        &shader_create,
+                        id,
+                        task.shader.id(),
+                        &task.shader_defs,
+                    ) {
                         Ok(module) => Some(module),
                         Err(err) => return Err(err),
                     },
@@ -769,10 +797,12 @@ impl PipelineCache {
                 let layout = if descriptor.layout.is_empty() && descriptor.immediate_size == 0 {
                     None
                 } else {
-                    Some(layout_cache.get(&device, &bind_group_layout, descriptor.immediate_size))
+                    Some(layout_cache.lock().unwrap().get(
+                        &device,
+                        &bind_group_layout,
+                        descriptor.immediate_size,
+                    ))
                 };
-
-                drop((shader_cache, layout_cache));
 
                 let fragment_data = descriptor.fragment.as_ref().map(|fragment| {
                     (
